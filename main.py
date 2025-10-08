@@ -4,6 +4,7 @@ import threading
 import time
 import yfinance as yf
 import pandas as pd
+import requests
 from quart import Quart, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler
@@ -14,7 +15,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ========================
-# 🧠 Initial Setup
+# 🧩 Grundkonfiguration
 # ========================
 app = Quart(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,8 +31,42 @@ if not CHAT_ID:
 application = Application.builder().token(BOT_TOKEN).build()
 training_status = {"running": False, "accuracy": None, "message": ""}
 
+
 # ========================
-# 📈 Trainingsfunktion
+# 📊 Fallback-Datenabruf
+# ========================
+def get_eurusd_data(period="1mo", interval="1h"):
+    """Versucht Daten von Yahoo Finance, fällt auf Apple Finance zurück."""
+    try:
+        df = yf.download("EURUSD=X", period=period, interval=interval, progress=False)
+        if df.empty:
+            raise ValueError("Keine Daten von Yahoo Finance")
+        return df
+    except Exception as e:
+        print("⚠️ Yahoo Finance fehlgeschlagen:", e)
+        print("↩️ Wechsle zu Apple Finance...")
+        try:
+            url = "https://finance.apple.com/api/quotes/EURUSD=X"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            quote = data.get("quote", {})
+            price = quote.get("regularMarketPrice")
+            if not price:
+                raise ValueError("Apple Finance liefert keine gültigen Daten.")
+            df = pd.DataFrame([{
+                "Open": price,
+                "High": price,
+                "Low": price,
+                "Close": price
+            }])
+            return df
+        except Exception as e2:
+            print("❌ Apple Finance ebenfalls fehlgeschlagen:", e2)
+            return pd.DataFrame()
+
+
+# ========================
+# 🧠 Trainingslogik
 # ========================
 async def train_model():
     global training_status
@@ -40,10 +75,9 @@ async def train_model():
     print(training_status["message"])
 
     try:
-        df = yf.download("EURUSD=X", period="1mo", interval="1h")
-        df.dropna(inplace=True)
-        if len(df) < 10:
-            training_status["message"] = "❌ Zu wenige Daten."
+        df = get_eurusd_data(period="1mo", interval="1h")
+        if df.empty or len(df) < 10:
+            training_status["message"] = "❌ Keine oder zu wenige Daten für Training."
             training_status["running"] = False
             return
 
@@ -89,20 +123,21 @@ async def status(update, context):
 
 
 async def predict(update, context):
-    df = yf.download("EURUSD=X", period="1d", interval="1h")
+    df = get_eurusd_data(period="1d", interval="1h")
     if df.empty:
-        await update.message.reply_text("❌ Keine Daten.")
+        await update.message.reply_text("❌ Keine Marktdaten abrufbar.")
         return
     last = df.iloc[-1]
     change = last["Close"] - last["Open"]
     signal = "📈 BUY" if change > 0 else "📉 SELL"
-    await update.message.reply_text(f"{signal} — Δ {round(change,5)}")
+    await update.message.reply_text(f"{signal} — Δ {round(change, 5)}")
 
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("train", train))
 application.add_handler(CommandHandler("status", status))
 application.add_handler(CommandHandler("predict", predict))
+
 
 # ========================
 # 🌐 Quart API
@@ -135,11 +170,11 @@ async def auto_trainer():
                 )
             except Exception as e:
                 print("Warnung: Telegram-Nachricht fehlgeschlagen:", e)
-        await asyncio.sleep(6 * 60 * 60)  # 6 Stunden warten
+        await asyncio.sleep(6 * 60 * 60)
 
 
 # ========================
-# 🧩 Code-Wächter (Auto-Neustart)
+# 👁️ Watchdog für Codeänderungen
 # ========================
 class RestartHandler(FileSystemEventHandler):
     def __init__(self, loop):
@@ -196,11 +231,8 @@ async def main():
         except Exception as e:
             print("Info: Startup-Message fehlgeschlagen:", e)
 
-    # Watchdog starten
     loop = asyncio.get_running_loop()
     threading.Thread(target=start_watchdog, args=(loop,), daemon=True).start()
-
-    # Auto-Training starten
     asyncio.create_task(auto_trainer())
 
     config = Config()
