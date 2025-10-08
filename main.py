@@ -24,7 +24,7 @@ INTERVAL = "1min"   # 1-Minuten-Kerzen
 TRAIN_INTERVAL_HOURS = 6
 
 # === Telegram Bot Setup ===
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://monica-option-bot.onrender.com") + "/webhook"
 application = Application.builder().token(TOKEN).build()
 
