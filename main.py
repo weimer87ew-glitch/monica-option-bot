@@ -2,8 +2,9 @@ import os
 import asyncio
 import threading
 import time
-import pandas as pd
 import yfinance as yf
+import pandas as pd
+import requests
 from quart import Quart, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler
@@ -12,7 +13,6 @@ from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import requests
 
 # ========================
 # 🧠 Initial Setup
@@ -20,8 +20,9 @@ import requests
 app = Quart(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://monica-option-bot.onrender.com"
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://monica-option.onrender.com"
 PORT = int(os.getenv("PORT", "10000"))
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN fehlt in Environment Variables")
@@ -32,39 +33,57 @@ application = Application.builder().token(BOT_TOKEN).build()
 training_status = {"running": False, "accuracy": None, "message": ""}
 
 # ========================
-# 📊 Datenbeschaffung mit Fallback
+# 📊 Datenbeschaffung
 # ========================
-async def get_eurusd_data(period="1mo", interval="1h", retries=3, delay=10):
-    """Versucht zuerst Yahoo Finance, dann Apple Finance, mit automatischem Retry."""
-    for attempt in range(retries):
-        try:
-            print(f"📡 Lade EURUSD von Yahoo (Versuch {attempt+1}/{retries})...")
-            df = yf.download("EURUSD=X", period=period, interval=interval, progress=False)
-            if not df.empty:
-                return df
-        except Exception as e:
-            print(f"⚠️ Yahoo Finance Fehler: {e}")
+def get_forex_data():
+    """Versucht zuerst Yahoo Finance, dann TwelveData."""
+    try:
+        df = yf.download("EURUSD=X", period="1mo", interval="1h")
+        if not df.empty:
+            print("✅ Datenquelle: Yahoo Finance")
+            return df
+        else:
+            print("⚠️ Yahoo Finance leer – versuche TwelveData...")
+    except Exception as e:
+        print("⚠️ Yahoo Finance fehlgeschlagen:", e)
 
-        print(f"⚠️ Yahoo lieferte keine Daten, versuche Apple Finance...")
-        try:
-            url = f"https://query1.finance.apple.com/api/v1/quotes?symbols=EURUSD"
-            resp = requests.get(url, timeout=10)
-            data = resp.json().get("data", [])
-            if data:
-                price = float(data[0].get("last", 0))
-                df = pd.DataFrame([{"Open": price, "High": price, "Low": price, "Close": price}])
-                return df
-        except Exception as e:
-            print(f"⚠️ Apple Finance Fehler: {e}")
+    # Fallback: TwelveData API
+    if not TWELVEDATA_API_KEY:
+        print("❌ Kein TWELVEDATA_API_KEY gesetzt.")
+        return pd.DataFrame()
 
-        print(f"🔁 Neuer Versuch in {delay} Sekunden...")
-        await asyncio.sleep(delay)
+    try:
+        url = f"https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": "EUR/USD",
+            "interval": "1h",
+            "outputsize": 500,
+            "apikey": TWELVEDATA_API_KEY,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
 
-    print("❌ Keine Kursdaten erhalten (Yahoo & Apple fehlgeschlagen).")
-    return pd.DataFrame()
+        if "values" not in data:
+            print("❌ TwelveData Antwort ungültig:", data)
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime")
+        df = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low", "close": "Close"
+        })
+        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].astype(float)
+        print("✅ Datenquelle: TwelveData")
+        return df
+
+    except Exception as e:
+        print("❌ TwelveData fehlgeschlagen:", e)
+        return pd.DataFrame()
+
 
 # ========================
-# 🧠 Trainingsfunktion
+# 📈 Trainingsfunktion
 # ========================
 async def train_model():
     global training_status
@@ -73,12 +92,10 @@ async def train_model():
     print(training_status["message"])
 
     try:
-        df = await get_eurusd_data()
+        df = get_forex_data()
         if df.empty or len(df) < 10:
-            training_status["message"] = "❌ Keine ausreichenden Daten zum Trainieren."
+            training_status["message"] = "❌ Zu wenige oder keine Daten für Training."
             training_status["running"] = False
-            if CHAT_ID:
-                await application.bot.send_message(chat_id=CHAT_ID, text="⚠️ Keine Kursdaten erhalten. Training übersprungen.")
             return
 
         df["Target"] = df["Close"].shift(-1)
@@ -89,7 +106,7 @@ async def train_model():
         model.fit(X, y)
         acc = model.score(X, y)
         training_status["accuracy"] = round(acc * 100, 2)
-        training_status["message"] = f"✅ Training fertig: {training_status['accuracy']} % Genauigkeit"
+        training_status["message"] = f"✅ Training fertig: {training_status['accuracy']}% Genauigkeit"
         print(training_status["message"])
 
     except Exception as e:
@@ -99,11 +116,13 @@ async def train_model():
     finally:
         training_status["running"] = False
 
+
 # ========================
 # 🤖 Telegram Befehle
 # ========================
 async def start(update, context):
     await update.message.reply_text("👋 Monica Option Bot aktiv.\nBefehle: /train /status /predict")
+
 
 async def train(update, context):
     if training_status["running"]:
@@ -112,14 +131,16 @@ async def train(update, context):
         await update.message.reply_text("📊 Starte Training...")
         asyncio.create_task(train_model())
 
+
 async def status(update, context):
     msg = f"📡 Status: {'läuft' if training_status['running'] else 'bereit'}"
     if training_status["accuracy"]:
         msg += f"\n🎯 Genauigkeit: {training_status['accuracy']}%"
     await update.message.reply_text(msg)
 
+
 async def predict(update, context):
-    df = await get_eurusd_data(period="1d", interval="1h")
+    df = get_forex_data()
     if df.empty:
         await update.message.reply_text("❌ Keine Daten verfügbar.")
         return
@@ -128,10 +149,12 @@ async def predict(update, context):
     signal = "📈 BUY" if change > 0 else "📉 SELL"
     await update.message.reply_text(f"{signal} — Δ {round(change,5)}")
 
+
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("train", train))
 application.add_handler(CommandHandler("status", status))
 application.add_handler(CommandHandler("predict", predict))
+
 
 # ========================
 # 🌐 Quart API
@@ -140,12 +163,14 @@ application.add_handler(CommandHandler("predict", predict))
 async def index():
     return "✅ Monica Option Bot läuft."
 
+
 @app.route("/webhook", methods=["POST"])
 async def webhook():
     data = await request.get_json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return "OK"
+
 
 # ========================
 # 🔁 Automatisches Training
@@ -164,14 +189,16 @@ async def auto_trainer():
                 print("Warnung: Telegram-Nachricht fehlgeschlagen:", e)
         await asyncio.sleep(6 * 60 * 60)  # 6 Stunden warten
 
+
 # ========================
-# 🧩 Watchdog (Code-Neustart)
+# 🧩 Code-Wächter (Auto-Neustart)
 # ========================
 class RestartHandler(FileSystemEventHandler):
     def __init__(self, loop):
         super().__init__()
         self.loop = loop
         self._last = 0.0
+
     def on_modified(self, event):
         if not event.src_path.endswith(".py"):
             return
@@ -179,16 +206,17 @@ class RestartHandler(FileSystemEventHandler):
         if now - self._last < 1.0:
             return
         self._last = now
-        print(f"♻️ Änderung erkannt: {event.src_path} → Neustart")
+        print(f"♻️ Änderung erkannt: {event.src_path} -> Neustart")
         if CHAT_ID:
             coro = application.bot.send_message(chat_id=CHAT_ID, text="🔄 Bot wird neu gestartet (Code-Update)...")
             try:
                 fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
                 fut.result(timeout=5)
             except Exception as e:
-                print("Warnung: Restart-Nachricht fehlgeschlagen:", e)
+                print("Warnung: konnte Restart-Nachricht nicht senden:", e)
         time.sleep(0.5)
         os._exit(0)
+
 
 def start_watchdog(loop):
     handler = RestartHandler(loop)
@@ -202,6 +230,7 @@ def start_watchdog(loop):
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+
 
 # ========================
 # 🚀 Startpunkt
@@ -219,13 +248,17 @@ async def main():
         except Exception as e:
             print("Info: Startup-Message fehlgeschlagen:", e)
 
+    # Watchdog starten
     loop = asyncio.get_running_loop()
     threading.Thread(target=start_watchdog, args=(loop,), daemon=True).start()
+
+    # Auto-Training starten
     asyncio.create_task(auto_trainer())
 
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     await serve(app, config)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
