@@ -1,3 +1,5 @@
+# Verhindert alte Flask-Installationen
+Flask==0.0.0
 quart==0.19.6
 hypercorn==0.16.0
 python-telegram-bot==21.4
