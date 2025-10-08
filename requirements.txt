@@ -1,5 +1,3 @@
-# Verhindert alte Flask-Installationen
-Flask==0.0.0
 quart==0.19.6
 hypercorn==0.16.0
 python-telegram-bot==21.4
@@ -8,3 +6,7 @@ pandas==2.2.3
 scikit-learn==1.5.2
 requests==2.32.3
 watchdog==5.0.3
+
+# Stelle sicher, dass Flask nicht installiert wird
+# (verhindert versehentliche Flask-Imports durch Quart)
+Flask<2.0
