@@ -1,153 +1,262 @@
 import os
 import asyncio
-import pandas as pd
+import threading
+import time
 import yfinance as yf
+import pandas as pd
 import requests
 from quart import Quart, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
-import logging
-from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# === Einstellungen ===
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-SYMBOL = "EURUSD"
-INTERVAL = "1min"   # 1-Minuten-Kerzen
-TRAIN_INTERVAL_HOURS = 6
-
-# === Telegram Bot Setup ===
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "https://monica-option-bot.onrender.com") + "/webhook"
-application = Application.builder().token(TOKEN).build()
-
-# === Quart App ===
+# ========================
+# ⚙️ Initial Setup
+# ========================
 app = Quart(__name__)
 
-# === KI-Modelleinstellungen ===
-model = LogisticRegression()
-scaler = StandardScaler()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://monica-option-bot.onrender.com"
+PORT = int(os.getenv("PORT", "10000"))
 
-# === Funktion: Hole Kursdaten ===
-async def get_data():
-    """Hole Kursdaten von TwelveData (primär) oder Yahoo (Fallback)."""
-    logging.info("📡 Lade Kursdaten für %s...", SYMBOL)
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN fehlt in Environment Variables")
+if not CHAT_ID:
+    print("⚠️ WARNUNG: TELEGRAM_CHAT_ID nicht gesetzt – Benachrichtigungen deaktiviert.")
 
-    # --- Versuch 1: TwelveData ---
-    if TWELVEDATA_API_KEY:
-        try:
-            url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}/USD&interval={INTERVAL}&apikey={TWELVEDATA_API_KEY}&outputsize=100"
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+application = Application.builder().token(BOT_TOKEN).build()
+training_status = {"running": False, "accuracy": None, "message": ""}
 
-            if "values" in data:
-                df = pd.DataFrame(data["values"])
-                df["datetime"] = pd.to_datetime(df["datetime"])
-                df = df.sort_values("datetime")
-                df = df.astype({"open": float, "high": float, "low": float, "close": float})
-                logging.info("✅ Daten von TwelveData geladen (%d Einträge).", len(df))
-                return df
-            else:
-                logging.warning("⚠️ TwelveData liefert keine gültigen Werte.")
-        except Exception as e:
-            logging.warning("⚠️ TwelveData Fehler: %s", e)
 
-    # --- Versuch 2: Yahoo Finance ---
+# ========================
+# 📊 Daten laden (Yahoo + TwelveData)
+# ========================
+async def fetch_data(symbol="EURUSD=X", period="1d", interval="1m"):
+    print(f"📡 Lade {symbol} von Yahoo Finance...")
     try:
-        df = yf.download(f"{SYMBOL}=X", period="1d", interval="1m", progress=False)
+        df = yf.download(symbol, period=period, interval=interval)
         if not df.empty:
-            df = df.reset_index()
-            logging.info("✅ Yahoo Finance als Fallback erfolgreich (%d Zeilen).", len(df))
+            print("✅ Yahoo Finance Daten erfolgreich geladen.")
+            return df
+        print("⚠️ Yahoo Finance leer – versuche TwelveData...")
+    except Exception as e:
+        print(f"⚠️ Yahoo Finance Fehler: {e}")
+
+    td_interval = interval.replace("m", "min") if interval.endswith("m") else interval
+    api_key = os.getenv("TWELVEDATA_API_KEY")
+
+    if not api_key:
+        print("❌ Kein TWELVEDATA_API_KEY gesetzt.")
+        return pd.DataFrame()
+
+    url = (
+        f"https://api.twelvedata.com/time_series?"
+        f"symbol=EUR/USD&interval={td_interval}&apikey={api_key}&outputsize=100"
+    )
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if "values" in data:
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime")
+            df = df.astype({"open": float, "high": float, "low": float, "close": float})
+            df.rename(
+                columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"},
+                inplace=True,
+            )
+            print("✅ TwelveData Daten erfolgreich geladen.")
             return df
         else:
-            logging.warning("⚠️ Yahoo Finance leer.")
+            print(f"⚠️ TwelveData ungültige Antwort: {data}")
     except Exception as e:
-        logging.warning("❌ Yahoo Finance Fehler: %s", e)
+        print(f"⚠️ TwelveData Fehler: {e}")
 
-    return None
+    print("❌ Keine Kursdaten erhalten (Yahoo & TwelveData fehlgeschlagen).")
+    return pd.DataFrame()
 
-# === Funktion: Trainiere Modell ===
+
+# ========================
+# 🧠 Trainingsfunktion
+# ========================
 async def train_model():
-    logging.info("📊 Starte Training...")
-    df = await get_data()
-    if df is None or df.empty:
-        logging.warning("⚠️ Keine Daten zum Trainieren.")
-        return
+    global training_status
+    training_status["running"] = True
+    training_status["message"] = "📊 Training gestartet..."
+    print(training_status["message"])
 
-    # Feature Engineering
-    df["change"] = df["close"].diff()
-    df["target"] = (df["change"] > 0).astype(int)
-    df = df.dropna()
+    try:
+        df = await fetch_data("EURUSD=X", period="1d", interval="1h")
+        if df.empty or len(df) < 10:
+            training_status["message"] = "❌ Zu wenige oder keine Kursdaten."
+            print(training_status["message"])
+            return
 
-    X = df[["open", "high", "low", "close"]]
-    y = df["target"]
+        df["Target"] = df["Close"].shift(-1)
+        X = df[["Open", "High", "Low", "Close"]].iloc[:-1]
+        y = df["Target"].iloc[:-1]
 
-    X_scaled = scaler.fit_transform(X)
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+        model = LinearRegression()
+        model.fit(X, y)
+        acc = model.score(X, y)
+        training_status["accuracy"] = round(acc * 100, 2)
+        training_status["message"] = f"✅ Training fertig: {training_status['accuracy']}% Genauigkeit"
+        print(training_status["message"])
 
-    model.fit(X_train, y_train)
-    accuracy = model.score(X_test, y_test)
-    logging.info(f"✅ Training abgeschlossen — Genauigkeit: {accuracy * 100:.2f}%")
+    except Exception as e:
+        training_status["message"] = f"❌ Fehler beim Training: {e}"
+        print(training_status["message"])
 
-# === Telegram Bot Handler ===
-async def start(update: Update, context):
-    await update.message.reply_text("👋 Willkommen beim Monica Option Bot! Gib /predict ein, um die aktuelle Prognose zu erhalten.")
+    finally:
+        training_status["running"] = False
 
-async def predict(update: Update, context):
-    df = await get_data()
-    if df is None or df.empty:
-        await update.message.reply_text("⚠️ Keine Kursdaten verfügbar.")
+
+# ========================
+# 🤖 Telegram Befehle
+# ========================
+async def start(update, context):
+    await update.message.reply_text("👋 Monica Option Bot aktiv.\nBefehle: /train /status /predict")
+
+
+async def train(update, context):
+    if training_status["running"]:
+        await update.message.reply_text("⚙️ Training läuft bereits...")
+    else:
+        await update.message.reply_text("📊 Starte Training...")
+        asyncio.create_task(train_model())
+
+
+async def status(update, context):
+    msg = f"📡 Status: {'läuft' if training_status['running'] else 'bereit'}"
+    if training_status["accuracy"]:
+        msg += f"\n🎯 Genauigkeit: {training_status['accuracy']}%"
+    await update.message.reply_text(msg)
+
+
+async def predict(update, context):
+    df = await fetch_data("EURUSD=X", period="1d", interval="5min")
+    if df.empty:
+        await update.message.reply_text("❌ Keine aktuellen Kursdaten.")
         return
 
     last = df.iloc[-1]
-    X_last = scaler.transform([[last["open"], last["high"], last["low"], last["close"]]])
-    prediction = model.predict(X_last)[0]
-    signal = "📈 Kaufen" if prediction == 1 else "📉 Verkaufen"
+    change = float(last["Close"]) - float(last["Open"])
+    signal = "📈 BUY" if change > 0 else "📉 SELL"
+    await update.message.reply_text(f"{signal} — Δ {round(change, 5)}")
 
-    await update.message.reply_text(f"📊 EUR/USD Signal: {signal}\nLetzter Kurs: {last['close']}")
 
 application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("train", train))
+application.add_handler(CommandHandler("status", status))
 application.add_handler(CommandHandler("predict", predict))
 
-# === Webhook Setup ===
+
+# ========================
+# 🌐 Quart API
+# ========================
+@app.route("/")
+async def index():
+    return "✅ Monica Option Bot läuft."
+
+
 @app.route("/webhook", methods=["POST"])
 async def webhook():
     data = await request.get_json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
-    return "ok", 200
+    return "OK"
 
-@app.route("/")
-async def home():
-    return "✅ Monica Option Bot läuft stabil."
 
-# === Automatisches Training ===
-async def auto_train_loop():
+# ========================
+# 🔁 Automatisches Training
+# ========================
+async def auto_trainer():
     while True:
+        print("⏱️ Starte automatisches Training (alle 10 Minuten)...")
         await train_model()
-        logging.info(f"⏰ Nächstes Training in {TRAIN_INTERVAL_HOURS} Stunden.")
-        await asyncio.sleep(TRAIN_INTERVAL_HOURS * 3600)
+        if CHAT_ID:
+            try:
+                await application.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"🤖 Automatisches Training abgeschlossen.\n🎯 Genauigkeit: {training_status.get('accuracy', 'N/A')}%"
+                )
+            except Exception as e:
+                print("⚠️ Telegram-Sendeproblem:", e)
+        await asyncio.sleep(10 * 60)  # 10 Minuten warten
 
-# === Main Start ===
+
+# ========================
+# 🧩 Watchdog (Auto-Neustart)
+# ========================
+class RestartHandler(FileSystemEventHandler):
+    def __init__(self, loop):
+        super().__init__()
+        self.loop = loop
+        self._last = 0.0
+
+    def on_modified(self, event):
+        if not event.src_path.endswith(".py"):
+            return
+        now = time.time()
+        if now - self._last < 1.0:
+            return
+        self._last = now
+        print(f"♻️ Änderung erkannt: {event.src_path} -> Neustart")
+        if CHAT_ID:
+            coro = application.bot.send_message(chat_id=CHAT_ID, text="🔄 Code-Update erkannt, Bot startet neu...")
+            try:
+                fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+                fut.result(timeout=5)
+            except Exception:
+                pass
+        time.sleep(0.5)
+        os._exit(0)
+
+
+def start_watchdog(loop):
+    handler = RestartHandler(loop)
+    observer = Observer()
+    observer.schedule(handler, ".", recursive=True)
+    observer.start()
+    print("🔍 Watchdog läuft...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+
+# ========================
+# 🚀 Startpunkt
+# ========================
 async def main():
-    logging.info("🚀 Initialisiere Monica Option Bot...")
-    await train_model()
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-    logging.info("✅ Webhook gesetzt: %s", WEBHOOK_URL)
+    print("🚀 Initialisiere Monica Option Bot...")
+    await application.initialize()
+    webhook_url = f"{RENDER_URL}/webhook"
+    await application.bot.set_webhook(webhook_url)
+    print(f"✅ Webhook gesetzt: {webhook_url}")
 
-    asyncio.create_task(auto_train_loop())
+    if CHAT_ID:
+        try:
+            await application.bot.send_message(chat_id=CHAT_ID, text="✅ Monica Option Bot gestartet.")
+        except Exception:
+            pass
+
+    loop = asyncio.get_running_loop()
+    threading.Thread(target=start_watchdog, args=(loop,), daemon=True).start()
+    asyncio.create_task(auto_trainer())
 
     config = Config()
-    config.bind = ["0.0.0.0:10000"]
+    config.bind = [f"0.0.0.0:{PORT}"]
     await serve(app, config)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
