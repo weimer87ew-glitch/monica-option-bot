@@ -6,6 +6,7 @@ import requests
 import threading
 import pandas as pd
 import numpy as np
+from flask import Flask
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -33,7 +34,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 def get_data_twelvedata(symbol="AAPL", interval="1h"):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize=100"
     r = requests.get(url)
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception:
+        print("⚠️ Fehler: ungültige JSON-Antwort von TwelveData.")
+        return pd.DataFrame()
+
     if "values" in data:
         df = pd.DataFrame(data["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
@@ -45,11 +51,14 @@ def get_data_twelvedata(symbol="AAPL", interval="1h"):
         return pd.DataFrame()
 
 def get_data_finnhub(symbol="AAPL"):
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-    r = requests.get(url).json()
-    if "c" in r:
-        df = pd.DataFrame([[time.time(), r["c"]]], columns=["datetime", "close"])
-        return df
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        r = requests.get(url).json()
+        if "c" in r:
+            df = pd.DataFrame([[time.time(), r["c"]]], columns=["datetime", "close"])
+            return df
+    except Exception as e:
+        print("⚠️ Fehler bei Finnhub:", e)
     return pd.DataFrame()
 
 # ==============================
@@ -158,9 +167,9 @@ def send_telegram_message(text):
         print("⚠️ Telegram Fehler:", e)
 
 # ==============================
-#   HAUPTFUNKTION
+#   BOT HAUPTLOGIK (Background)
 # ==============================
-def main():
+def bot_loop():
     print("🤖 Starte Monica Option Bot v3.6")
     restore_from_github()
     schedule_backup(interval_hours=2)
@@ -183,7 +192,6 @@ def main():
         send_telegram_message(f"📊 Signal: {signal}")
         print("Signal:", signal)
 
-        # alle 2 Stunden neu trainieren
         print("🔄 Warte 2 Stunden bis zum nächsten Training...")
         time.sleep(7200)
         df = get_data_twelvedata()
@@ -191,5 +199,16 @@ def main():
         upload_to_github()
         send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
+# ==============================
+#   FLASK SERVER (Render Port)
+# ==============================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ Monica Option Bot läuft (Render kompatibel)."
+
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=bot_loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
