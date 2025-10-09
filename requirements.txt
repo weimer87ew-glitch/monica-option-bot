@@ -8,7 +8,7 @@ python-telegram-bot==21.4
 
 # 📊 Daten & Machine Learning
 pandas==2.2.3
-numpy==1.26.4
+numpy>=1.26.4,<2.1
 scikit-learn==1.5.2
 
 # 🔗 APIs & Monitoring
@@ -18,3 +18,4 @@ matplotlib==3.9.2
 
 # 🧠 KI / Deep Learning
 tensorflow==2.20.0
+ml-dtypes==0.5.1
