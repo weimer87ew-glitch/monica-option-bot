@@ -7,14 +7,14 @@ import threading
 import asyncio
 import pandas as pd
 import numpy as np
-from flask import Flask
+from flask import Flask, request
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from telegram import Bot
 
 # ==============================
-#   KONFIGURATION
+# 🔧 CONFIG
 # ==============================
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
@@ -31,9 +31,26 @@ bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 # ==============================
-#   DATENLADER
+# 🌐 KEEP ALIVE (gegen Render-Sleep)
 # ==============================
-def get_data_twelvedata(symbol="AAPL", interval="1h"):
+def keep_alive():
+    """Sendet regelmäßig Anfragen an sich selbst, damit Render aktiv bleibt."""
+    def ping_loop():
+        while True:
+            try:
+                url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+                if url:
+                    requests.get(f"http://127.0.0.1:{os.getenv('PORT', 10000)}")
+                    print("💓 Keep-alive Ping gesendet")
+            except Exception as e:
+                print("⚠️ Keep-alive Fehler:", e)
+            time.sleep(300)  # alle 5 Minuten
+    threading.Thread(target=ping_loop, daemon=True).start()
+
+# ==============================
+# 💾 DATENLADER
+# ==============================
+def get_data_twelvedata(symbol="EUR/USD", interval="1h"):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize=100"
     try:
         r = requests.get(url, timeout=10)
@@ -51,8 +68,19 @@ def get_data_twelvedata(symbol="AAPL", interval="1h"):
         print("❌ Fehler beim Laden von TwelveData:", e)
         return pd.DataFrame()
 
+def get_data_finnhub(symbol="EURUSD"):
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        r = requests.get(url).json()
+        if "c" in r:
+            df = pd.DataFrame([[time.time(), r["c"]]], columns=["datetime", "close"])
+            return df
+    except Exception as e:
+        print("⚠️ Fehler bei Finnhub:", e)
+    return pd.DataFrame()
+
 # ==============================
-#   KI-MODELL
+# 🧠 KI-MODELL
 # ==============================
 def create_model(input_shape):
     model = Sequential([
@@ -84,26 +112,22 @@ def train_model(df):
     return model
 
 # ==============================
-#   GITHUB BACKUP & RESTORE
+# ☁️ GITHUB BACKUP & RESTORE
 # ==============================
 def upload_to_github():
     if not os.path.exists(LOCAL_MODEL_PATH):
         print("⚠️ Kein lokales Modell gefunden – Backup übersprungen.")
         return
-
     temp_h5 = "model.h5"
     os.system(f"cp {LOCAL_MODEL_PATH} {temp_h5}")
-
     with open(temp_h5, "rb") as f:
         content = f.read()
-
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     sha = None
     get_res = requests.get(url, headers=headers)
     if get_res.status_code == 200:
         sha = get_res.json().get("sha")
-
     data = {
         "message": f"Auto-Backup {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "content": base64.b64encode(content).decode("utf-8"),
@@ -111,7 +135,6 @@ def upload_to_github():
     }
     if sha:
         data["sha"] = sha
-
     res = requests.put(url, headers=headers, json=data)
     if res.status_code in [200, 201]:
         print(f"✅ Backup erfolgreich nach GitHub ({GITHUB_FILE_PATH})")
@@ -144,7 +167,7 @@ def schedule_backup(interval_hours=2):
     threading.Thread(target=loop, daemon=True).start()
 
 # ==============================
-#   TRADING LOGIK
+# 📈 TRADING LOGIK
 # ==============================
 def generate_signal(model, df):
     scaler = MinMaxScaler(feature_range=(0, 1))
@@ -165,29 +188,26 @@ def send_telegram_message(text):
     asyncio.run(send_async_message(text))
 
 # ==============================
-#   KEEP ALIVE FUNKTION
+# 🧩 FLASK ROUTES
 # ==============================
-def keep_alive_ping():
-    def loop():
-        while True:
-            try:
-                render_url = os.getenv("RENDER_EXTERNAL_URL")
-                if render_url:
-                    requests.get(render_url)
-                    print(f"🔄 Keep-Alive Ping an {render_url}")
-            except Exception as e:
-                print("⚠️ Keep-Alive Fehler:", e)
-            time.sleep(600)  # alle 10 Minuten
-    threading.Thread(target=loop, daemon=True).start()
+@app.route("/")
+def home():
+    return "✅ Monica Option Bot läuft stabil auf Render!"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True)
+    print("📩 Webhook-Daten:", data)
+    return "OK", 200
 
 # ==============================
-#   HAUPTSCHLEIFE
+# 🚀 HAUPTFUNKTION
 # ==============================
-def main_loop():
-    print("🤖 Starte Monica Option Bot v3.8 (mit Keep Alive)")
+def main():
+    print("🤖 Starte Monica Option Bot v4.0")
+    keep_alive()
     model_path = restore_from_github()
     schedule_backup(interval_hours=2)
-    keep_alive_ping()
 
     try:
         if model_path and os.path.exists(model_path):
@@ -223,14 +243,10 @@ def main_loop():
             send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
 # ==============================
-#   FLASK SERVER (Render)
+# 🏁 START
 # ==============================
-@app.route("/")
-def index():
-    return "✅ Monica Option Bot läuft mit Keep-Alive"
-
 if __name__ == "__main__":
-    threading.Thread(target=main_loop, daemon=True).start()
+    threading.Thread(target=main, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Server wird gestartet auf Port {port} ...")
+    print(f"🚀 Server läuft auf Port {port}")
     app.run(host="0.0.0.0", port=port)
