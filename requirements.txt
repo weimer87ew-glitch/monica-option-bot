@@ -1,10 +1,20 @@
+# 🌐 Web & Server
 quart==0.19.6
 flask==3.0.3
 hypercorn==0.16.0
+
+# 🤖 Telegram Bot
 python-telegram-bot==21.4
+
+# 📊 Daten & Machine Learning
 pandas==2.2.3
+numpy==1.26.4
 scikit-learn==1.5.2
+
+# 🔗 APIs & Monitoring
 requests==2.32.3
 watchdog==5.0.3
 matplotlib==3.9.2
-tensorflow==2.16.2
+
+# 🧠 KI / Deep Learning (CPU-optimiert für Render)
+tensorflow-cpu==2.16.2
