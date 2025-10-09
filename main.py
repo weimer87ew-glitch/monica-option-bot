@@ -215,5 +215,9 @@ def main():
             upload_to_github()
             send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
+import os
+
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8080))  # Render übergibt automatisch die PORT-Variable
+    print(f"🚀 Server wird gestartet auf Port {port} ...")
+    app.run(host="0.0.0.0", port=port)
