@@ -4,9 +4,9 @@ import json
 import base64
 import requests
 import threading
+import asyncio
 import pandas as pd
 import numpy as np
-from flask import Flask
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -24,7 +24,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 GITHUB_REPO = "weimer87ew-glitch/monica-option-bot"
 GITHUB_FILE_PATH = "backup/model.h5"
-LOCAL_MODEL_PATH = "model.h5"
+LOCAL_MODEL_PATH = "model.keras"
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -33,21 +33,20 @@ bot = Bot(token=TELEGRAM_TOKEN)
 # ==============================
 def get_data_twelvedata(symbol="AAPL", interval="1h"):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVEDATA_API_KEY}&outputsize=100"
-    r = requests.get(url)
     try:
+        r = requests.get(url, timeout=10)
         data = r.json()
-    except Exception:
-        print("⚠️ Fehler: ungültige JSON-Antwort von TwelveData.")
-        return pd.DataFrame()
-
-    if "values" in data:
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime")
-        df["close"] = df["close"].astype(float)
-        return df[["datetime", "close"]]
-    else:
-        print("⚠️ Fehler bei TwelveData:", data)
+        if "values" in data:
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime")
+            df["close"] = df["close"].astype(float)
+            return df[["datetime", "close"]]
+        else:
+            print("⚠️ Fehler bei TwelveData:", data)
+            return pd.DataFrame()
+    except Exception as e:
+        print("❌ Fehler beim Laden von TwelveData:", e)
         return pd.DataFrame()
 
 def get_data_finnhub(symbol="AAPL"):
@@ -90,7 +89,7 @@ def train_model(df):
     model = create_model((X.shape[1], 1))
     model.fit(X, y, epochs=5, batch_size=16, verbose=1)
     model.save(LOCAL_MODEL_PATH)
-    print("✅ Modell gespeichert:", LOCAL_MODEL_PATH)
+    print(f"✅ Modell gespeichert: {LOCAL_MODEL_PATH}")
     return model
 
 # ==============================
@@ -101,7 +100,11 @@ def upload_to_github():
         print("⚠️ Kein lokales Modell gefunden – Backup übersprungen.")
         return
 
-    with open(LOCAL_MODEL_PATH, "rb") as f:
+    # Kompatibilität: GitHub speichert weiter als .h5
+    temp_h5 = "model.h5"
+    os.system(f"cp {LOCAL_MODEL_PATH} {temp_h5}")
+
+    with open(temp_h5, "rb") as f:
         content = f.read()
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -132,11 +135,13 @@ def restore_from_github():
     if res.status_code == 200:
         data = res.json()
         content = base64.b64decode(data["content"])
-        with open(LOCAL_MODEL_PATH, "wb") as f:
+        with open("model.h5", "wb") as f:
             f.write(content)
-        print("✅ Modell aus GitHub wiederhergestellt:", LOCAL_MODEL_PATH)
+        print("✅ Modell aus GitHub wiederhergestellt.")
+        return "model.h5"
     else:
-        print("⚠️ Kein GitHub-Backup gefunden")
+        print("⚠️ Kein GitHub-Backup gefunden.")
+        return None
 
 def schedule_backup(interval_hours=2):
     def loop():
@@ -160,27 +165,37 @@ def generate_signal(model, df):
     last_close = data[-1][0]
     return "BUY" if pred > last_close else "SELL"
 
-def send_telegram_message(text):
+async def send_async_message(text):
     try:
-        bot.send_message(chat_id=CHAT_ID, text=text)
+        await bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception as e:
         print("⚠️ Telegram Fehler:", e)
 
+def send_telegram_message(text):
+    asyncio.run(send_async_message(text))
+
 # ==============================
-#   BOT HAUPTLOGIK (Background)
+#   HAUPTFUNKTION
 # ==============================
-def bot_loop():
-    print("🤖 Starte Monica Option Bot v3.6")
-    restore_from_github()
+def main():
+    print("🤖 Starte Monica Option Bot v3.7")
+    model_path = restore_from_github()
     schedule_backup(interval_hours=2)
 
     try:
-        model = load_model(LOCAL_MODEL_PATH)
-        print("✅ Modell geladen.")
+        if model_path and os.path.exists(model_path):
+            model = load_model(model_path)
+            print("✅ Modell geladen.")
+        else:
+            raise FileNotFoundError
     except Exception:
         print("⚠️ Kein Modell vorhanden – trainiere neu.")
         df = get_data_twelvedata()
-        model = train_model(df)
+        if not df.empty:
+            model = train_model(df)
+        else:
+            print("❌ Keine Daten zum Trainieren verfügbar!")
+            return
 
     while True:
         df = get_data_twelvedata()
@@ -195,20 +210,10 @@ def bot_loop():
         print("🔄 Warte 2 Stunden bis zum nächsten Training...")
         time.sleep(7200)
         df = get_data_twelvedata()
-        model = train_model(df)
-        upload_to_github()
-        send_telegram_message("💾 Neues Modell trainiert und gesichert.")
-
-# ==============================
-#   FLASK SERVER (Render Port)
-# ==============================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Monica Option Bot läuft (Render kompatibel)."
+        if not df.empty:
+            model = train_model(df)
+            upload_to_github()
+            send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    main()
