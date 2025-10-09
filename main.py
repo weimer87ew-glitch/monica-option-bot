@@ -11,6 +11,7 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from telegram import Bot
+from flask import Flask
 
 # ==============================
 #   CONFIG
@@ -100,7 +101,6 @@ def upload_to_github():
         print("⚠️ Kein lokales Modell gefunden – Backup übersprungen.")
         return
 
-    # Kompatibilität: GitHub speichert weiter als .h5
     temp_h5 = "model.h5"
     os.system(f"cp {LOCAL_MODEL_PATH} {temp_h5}")
 
@@ -215,9 +215,25 @@ def main():
             upload_to_github()
             send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
-import os
+# ==============================
+#   WEB SERVER (für Render)
+# ==============================
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "✅ Monica Option Bot läuft.", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    return "OK", 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))  # Render übergibt automatisch die PORT-Variable
+    port = int(os.environ.get("PORT", 8080))
     print(f"🚀 Server wird gestartet auf Port {port} ...")
+
+    # Bot im Hintergrund starten
+    threading.Thread(target=main, daemon=True).start()
+
+    # Flask-Server offenhalten (für Render)
     app.run(host="0.0.0.0", port=port)
