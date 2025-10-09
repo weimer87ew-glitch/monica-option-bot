@@ -7,14 +7,14 @@ import threading
 import asyncio
 import pandas as pd
 import numpy as np
+from flask import Flask
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from telegram import Bot
-from flask import Flask
 
 # ==============================
-#   CONFIG
+#   KONFIGURATION
 # ==============================
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
@@ -28,6 +28,7 @@ GITHUB_FILE_PATH = "backup/model.h5"
 LOCAL_MODEL_PATH = "model.keras"
 
 bot = Bot(token=TELEGRAM_TOKEN)
+app = Flask(__name__)
 
 # ==============================
 #   DATENLADER
@@ -49,17 +50,6 @@ def get_data_twelvedata(symbol="AAPL", interval="1h"):
     except Exception as e:
         print("❌ Fehler beim Laden von TwelveData:", e)
         return pd.DataFrame()
-
-def get_data_finnhub(symbol="AAPL"):
-    try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-        r = requests.get(url).json()
-        if "c" in r:
-            df = pd.DataFrame([[time.time(), r["c"]]], columns=["datetime", "close"])
-            return df
-    except Exception as e:
-        print("⚠️ Fehler bei Finnhub:", e)
-    return pd.DataFrame()
 
 # ==============================
 #   KI-MODELL
@@ -175,12 +165,29 @@ def send_telegram_message(text):
     asyncio.run(send_async_message(text))
 
 # ==============================
-#   HAUPTFUNKTION
+#   KEEP ALIVE FUNKTION
 # ==============================
-def main():
-    print("🤖 Starte Monica Option Bot v3.7")
+def keep_alive_ping():
+    def loop():
+        while True:
+            try:
+                render_url = os.getenv("RENDER_EXTERNAL_URL")
+                if render_url:
+                    requests.get(render_url)
+                    print(f"🔄 Keep-Alive Ping an {render_url}")
+            except Exception as e:
+                print("⚠️ Keep-Alive Fehler:", e)
+            time.sleep(600)  # alle 10 Minuten
+    threading.Thread(target=loop, daemon=True).start()
+
+# ==============================
+#   HAUPTSCHLEIFE
+# ==============================
+def main_loop():
+    print("🤖 Starte Monica Option Bot v3.8 (mit Keep Alive)")
     model_path = restore_from_github()
     schedule_backup(interval_hours=2)
+    keep_alive_ping()
 
     try:
         if model_path and os.path.exists(model_path):
@@ -216,24 +223,14 @@ def main():
             send_telegram_message("💾 Neues Modell trainiert und gesichert.")
 
 # ==============================
-#   WEB SERVER (für Render)
+#   FLASK SERVER (Render)
 # ==============================
-app = Flask(__name__)
-
 @app.route("/")
 def index():
-    return "✅ Monica Option Bot läuft.", 200
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    return "OK", 200
+    return "✅ Monica Option Bot läuft mit Keep-Alive"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=main_loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Server wird gestartet auf Port {port} ...")
-
-    # Bot im Hintergrund starten
-    threading.Thread(target=main, daemon=True).start()
-
-    # Flask-Server offenhalten (für Render)
     app.run(host="0.0.0.0", port=port)
