@@ -18,7 +18,7 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 GITHUB_REPO = "weimer87ew-glitch/monica-option-bot"
