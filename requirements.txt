@@ -16,5 +16,5 @@ requests==2.32.3
 watchdog==5.0.3
 matplotlib==3.9.2
 
-# 🧠 KI / Deep Learning (CPU-optimiert für Render)
-tensorflow-cpu==2.16.2
+# 🧠 KI / Deep Learning
+tensorflow==2.20.0
